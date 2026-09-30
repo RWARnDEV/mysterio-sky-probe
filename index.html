@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=600, height=600, initial-scale=1.0, user-scalable=no">
+<meta name="application-name" content="Mysterio Sky Probe">
+<meta name="description" content="Measures Meta Ray-Ban Display head orientation for world-locked sky overlays.">
+<meta name="mrbd-web-app-capable" content="yes">
+<title>Sky Probe</title>
+<style>
+  :root { --fg: #ffffff; --dim: #9fb3c8; --accent: #00d4ff; --warn: #ffb020; --bad: #ff5a5a; --ok: #5dff8a; }
+  html, body { margin: 0; background: #000; color: var(--fg); }
+  body { width: 600px; height: 600px; overflow: hidden; font: 20px/1.25 system-ui, sans-serif; position: relative; }
+  canvas { position: absolute; left: 0; top: 0; }
+  #bar { position: absolute; left: 0; right: 0; bottom: 0; height: 96px; display: flex; gap: 8px; padding: 4px 8px; box-sizing: border-box; }
+  button { flex: 1; min-height: 88px; background: #000; color: var(--fg); border: 2px solid #3a4a5a; border-radius: 16px; font: 600 22px system-ui, sans-serif; }
+  button:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 20px rgba(0, 212, 255, .45); color: var(--accent); }
+  .hidden { display: none !important; }
+  #intro { position: absolute; left: 24px; right: 24px; top: 40px; font-size: 22px; color: var(--dim); }
+  #intro b { color: var(--fg); }
+</style>
+</head>
+<body>
+<canvas id="c" width="600" height="600"></canvas>
+<div id="intro">
+  <b>Mysterio Sky Probe</b><br><br>
+  Measures glasses heading, tilt and roll for world-locked overlays.<br><br>
+  Stand outdoors, look straight at the horizon, then press <b>Start</b> and allow motion and location.
+</div>
+<div id="bar">
+  <button id="start" class="focusable">Start</button>
+  <button id="pin" class="focusable hidden">Pin</button>
+  <button id="mark" class="focusable hidden">Mark N</button>
+  <button id="fovDown" class="focusable hidden">FOV −</button>
+  <button id="fovUp" class="focusable hidden">FOV +</button>
+</div>
+<script>
+'use strict';
+const D = Math.PI / 180, W = 600, H = 600, CX = 300, CY = 252; // overlay centre sits above the button bar
+const demo = new URLSearchParams(location.search).has('demo');
+const $ = id => document.getElementById(id);
+const ctx = $('c').getContext('2d');
+
+// ---- persisted per-viewer settings (safe if storage is unavailable) ----
+function load(k, d) { try { const v = localStorage.getItem('skyprobe.' + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } }
+function save(k, v) { try { localStorage.setItem('skyprobe.' + k, JSON.stringify(v)); } catch (e) {} }
+
+const S = {
+  started: false, perm: '—', ori: null, oriT: 0, absSeen: false, relSeen: false,
+  rate: { ori: 0, abs: 0, mot: 0 }, cnt: { ori: 0, abs: 0, mot: 0 }, rateT: performance.now(),
+  gyro: null, fix: null, geoErr: '', fov: load('fov', 22), flip: load('flip', false),
+  model: null, pin: null, marks: [], lag: null, noise: null,
+  qHist: [], gHist: [], headHist: [],
+};
+
+// ---- orientation maths (W3C: R = Rz(alpha) Rx(beta) Ry(gamma), device -> earth; earth X=east, Y=north, Z=up) ----
+function rot(a, b, g) {
+  const ca = Math.cos(a), sa = Math.sin(a), cb = Math.cos(b), sb = Math.sin(b), cg = Math.cos(g), sg = Math.sin(g);
+  return [
+    [ca * cg - sa * sb * sg, -cb * sa, ca * sg + cg * sa * sb],
+    [cg * sa + ca * sb * sg,  ca * cb, sa * sg - ca * cg * sb],
+    [-cb * sg,                sb,      cb * cg],
+  ];
+}
+function matrix(o) { return rot((S.flip ? -o.alpha : o.alpha) * D, o.beta * D, o.gamma * D); }
+const col = (R, i) => [R[0][i], R[1][i], R[2][i]];
+const neg = v => [-v[0], -v[1], -v[2]];
+// Candidate device frames. Which one the glasses use is unknown until measured.
+const MODELS = {
+  A: { name: 'fwd −Z', fwd: R => neg(col(R, 2)), up: R => col(R, 1), right: R => col(R, 0) },
+  C: { name: 'fwd +Z', fwd: R => col(R, 2), up: R => col(R, 1), right: R => neg(col(R, 0)) },
+  B: { name: 'fwd +Y', fwd: R => col(R, 1), up: R => col(R, 2), right: R => col(R, 0) },
+};
+function pickModel(o) { return Math.abs(o.beta) > 45 ? (o.beta > 0 ? 'A' : 'C') : 'B'; }
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+function azEl(v) { return { az: (Math.atan2(v[0], v[1]) / D + 360) % 360, el: Math.asin(Math.max(-1, Math.min(1, v[2]))) / D }; }
+function vec(az, el) { return [Math.cos(el * D) * Math.sin(az * D), Math.cos(el * D) * Math.cos(az * D), Math.sin(el * D)]; }
+function wrap(d) { return ((d + 540) % 360) - 180; }
+function focal() { return (W / 2) / Math.tan(S.fov / 2 * D); }
+function project(v, R, m) {
+  const f = dot(v, m.fwd(R)); if (f <= 0.05) return null;
+  const k = focal() / f;
+  return { x: CX + dot(v, m.right(R)) * k, y: CY - dot(v, m.up(R)) * k };
+}
+function quat(o) { // for axis-agnostic angular speed
+  const a = o.alpha * D / 2, b = o.beta * D / 2, g = o.gamma * D / 2;
+  const ca = Math.cos(a), sa = Math.sin(a), cb = Math.cos(b), sb = Math.sin(b), cg = Math.cos(g), sg = Math.sin(g);
+  return [ca * cb * cg - sa * sb * sg, ca * sb * cg - sa * cb * sg, ca * cb * sg + sa * sb * cg, sa * cb * cg + ca * sb * sg];
+}
+
+// ---- sun position (NOAA-style approximation, ~0.5°; ignores refraction) ----
+function sun(date, lat, lon) {
+  const n = date.getTime() / 86400000 + 2440587.5 - 2451545.0;
+  const L = (280.460 + 0.9856474 * n) % 360, g = ((357.528 + 0.9856003 * n) % 360) * D;
+  const lam = (L + 1.915 * Math.sin(g) + 0.020 * Math.sin(2 * g)) * D, eps = (23.439 - 0.0000004 * n) * D;
+  const ra = Math.atan2(Math.cos(eps) * Math.sin(lam), Math.cos(lam)), dec = Math.asin(Math.sin(eps) * Math.sin(lam));
+  const gmst = ((18.697374558 + 24.06570982441908 * n) % 24 + 24) % 24;
+  const h = (gmst * 15 + lon) * D - ra, la = lat * D;
+  const el = Math.asin(Math.sin(la) * Math.sin(dec) + Math.cos(la) * Math.cos(dec) * Math.cos(h));
+  const az = Math.atan2(-Math.sin(h), Math.tan(dec) * Math.cos(la) - Math.sin(la) * Math.cos(h));
+  return { az: (az / D + 360) % 360, el: el / D };
+}
+
+// ---- sensor intake ----
+function onOri(e, kind) {
+  if (e.alpha == null || e.beta == null || e.gamma == null) return;
+  S.cnt[kind]++;
+  if (kind === 'abs') S.absSeen = true; else S.relSeen = true;
+  // Prefer the Earth-referenced stream when both arrive.
+  if (kind === 'ori' && S.absSeen && !e.absolute) return;
+  const t = e.timeStamp || performance.now();
+  S.ori = { alpha: e.alpha, beta: e.beta, gamma: e.gamma, absolute: kind === 'abs' || !!e.absolute };
+  S.oriT = performance.now();
+  S.qHist.push([t, quat(S.ori)]); trim(S.qHist, t);
+  S.headHist.push([t, S.ori.alpha]); trim(S.headHist, t, 2500);
+}
+function onMot(e) {
+  S.cnt.mot++;
+  const r = e.rotationRate; if (!r || r.alpha == null) return;
+  const t = e.timeStamp || performance.now();
+  S.gyro = Math.hypot(r.alpha, r.beta || 0, r.gamma || 0);
+  S.gHist.push([t, S.gyro]); trim(S.gHist, t);
+}
+function trim(a, t, ms = 4000) { while (a.length && t - a[0][0] > ms) a.shift(); }
+
+async function start() {
+  S.perm = 'requesting';
+  try {
+    const DOE = window.DeviceOrientationEvent;
+    if (DOE && typeof DOE.requestPermission === 'function') S.perm = await DOE.requestPermission();
+    else S.perm = DOE ? 'not required' : 'unsupported';
+  } catch (err) { S.perm = 'error: ' + err.name; }
+  if (S.perm === 'granted' || S.perm === 'not required') {
+    addEventListener('deviceorientation', e => onOri(e, 'ori'));
+    addEventListener('deviceorientationabsolute', e => onOri(e, 'abs'));
+    addEventListener('devicemotion', onMot);
+  }
+  if (navigator.geolocation) {
+    navigator.geolocation.watchPosition(
+      p => { S.fix = p.coords; S.fixT = Date.now(); S.geoErr = ''; },
+      e => { S.geoErr = ['', 'denied', 'unavailable', 'timeout'][e.code] || e.message; },
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 5000 });
+  } else S.geoErr = 'no geolocation';
+  if (demo) startDemo();
+  S.started = true;
+  $('intro').classList.add('hidden'); $('start').classList.add('hidden');
+  for (const id of ['pin', 'mark', 'fovDown', 'fovUp']) $(id).classList.remove('hidden');
+  $('pin').focus();
+}
+
+// Browser-only simulation for checking the page without glasses (?demo). Never used on the glasses.
+function startDemo() {
+  S.perm = 'demo'; S.fix = { latitude: 38.9, longitude: -77.03, accuracy: 12 }; S.fixT = Date.now();
+  const t0 = performance.now(); let lagged = [];
+  setInterval(() => {
+    const t = performance.now(), s = (t - t0) / 1000;
+    const yaw = 30 * Math.sin(s * 3) + 90, pitch = 8 * Math.sin(s * 0.5), roll = 4 * Math.sin(s * 0.7);
+    lagged.push([t, yaw, pitch, roll]); while (lagged.length && t - lagged[0][0] > 35) lagged.shift();
+    const [, y, p, r] = lagged[0];
+    const rate = 30 * 3 * Math.cos(s * 3); // deg/s; the simulated orientation trails it by ~35 ms
+    onMot({ timeStamp: t, rotationRate: { alpha: rate, beta: 4 * Math.cos(s * 0.5), gamma: 0 } });
+    onOri({ timeStamp: t, alpha: (360 - y + 360) % 360, beta: 90 + p, gamma: r, absolute: true }, 'abs');
+  }, 16);
+}
+
+// ---- measurements ----
+function speedSeries() { // orientation angular speed, deg/s
+  const q = S.qHist, out = [];
+  for (let i = 1; i < q.length; i++) {
+    const dt = (q[i][0] - q[i - 1][0]) / 1000; if (dt <= 0) continue;
+    const d = Math.abs(q[i][1][0] * q[i - 1][1][0] + q[i][1][1] * q[i - 1][1][1] + q[i][1][2] * q[i - 1][1][2] + q[i][1][3] * q[i - 1][1][3]);
+    out.push([q[i][0], 2 * Math.acos(Math.min(1, d)) / D / dt]);
+  }
+  return out;
+}
+function sample(series, t) {
+  if (!series.length || t < series[0][0] || t > series[series.length - 1][0]) return null;
+  let i = 1; while (i < series.length && series[i][0] < t) i++;
+  const [t0, v0] = series[i - 1], [t1, v1] = series[i] || series[i - 1];
+  return t1 === t0 ? v0 : v0 + (v1 - v0) * (t - t0) / (t1 - t0);
+}
+function estimateLag() { // how far orientation speed trails gyro speed (sensor fusion lag, not display latency)
+  const g = S.gHist, o = speedSeries(); if (g.length < 30 || o.length < 30) return null;
+  if (Math.max(...g.map(x => x[1])) < 30) return null; // needs a deliberate head turn
+  const t1 = Math.min(g[g.length - 1][0], o[o.length - 1][0]) - 320, t0 = Math.max(g[0][0], o[0][0]);
+  if (t1 - t0 < 1000) return null;
+  let best = null;
+  for (let lag = 0; lag <= 300; lag += 10) {
+    const a = [], b = [];
+    for (let t = t0; t < t1; t += 10) { const x = sample(g, t), y = sample(o, t + lag); if (x != null && y != null) { a.push(x); b.push(y); } }
+    const r = corr(a, b); if (r != null && (!best || r > best.r)) best = { lag, r };
+  }
+  return best && best.r > 0.6 ? best : null;
+}
+function corr(a, b) {
+  const n = a.length; if (n < 20) return null;
+  const ma = a.reduce((s, x) => s + x, 0) / n, mb = b.reduce((s, x) => s + x, 0) / n;
+  let sab = 0, saa = 0, sbb = 0;
+  for (let i = 0; i < n; i++) { const da = a[i] - ma, db = b[i] - mb; sab += da * db; saa += da * da; sbb += db * db; }
+  return saa && sbb ? sab / Math.sqrt(saa * sbb) : null;
+}
+function stillNoise() {
+  const h = S.headHist; if (h.length < 20) return null;
+  if (S.gHist.length && S.gHist.slice(-20).some(x => x[1] > 3)) return null;
+  const ref = h[h.length - 1][1], d = h.map(x => wrap(x[1] - ref)), m = d.reduce((s, x) => s + x, 0) / d.length;
+  return Math.sqrt(d.reduce((s, x) => s + (x - m) * (x - m), 0) / d.length);
+}
+
+// ---- actions ----
+function heading(o) { return S.flip ? o.alpha : (360 - o.alpha) % 360; } // W3C alpha is counter-clockwise
+function view(o) { const R = matrix(o), m = MODELS[S.model || pickModel(o)]; return { R, m, ...azEl(m.fwd(R)) }; }
+function pin() {
+  if (!fresh()) return;
+  if (!S.model) S.model = pickModel(S.ori);
+  const v = view(S.ori); S.pin = { az: v.az, el: v.el };
+}
+const LABELS = ['N', 'E', 'S', 'W'];
+function mark() {
+  if (!fresh()) return;
+  const label = LABELS[S.marks.length % 4];
+  if (label === 'N') { S.model = pickModel(S.ori); if (S.marks.length >= 4) S.marks = []; }
+  S.marks.push({ label, alpha: S.ori.alpha, beta: S.ori.beta, gamma: S.ori.gamma });
+  // After N then E, infer rotation sense: a clockwise turn should add ~90° of compass heading.
+  if (S.marks.length === 2) {
+    const d = wrap(S.marks[1].alpha - S.marks[0].alpha);
+    if (Math.abs(Math.abs(d) - 90) < 35) { S.flip = d > 0; save('flip', S.flip); }
+  }
+  $('mark').textContent = 'Mark ' + LABELS[S.marks.length % 4];
+}
+function fresh() { return S.ori && performance.now() - S.oriT < 500; }
+
+$('start').addEventListener('click', start);
+$('pin').addEventListener('click', pin);
+$('mark').addEventListener('click', mark);
+$('fovDown').addEventListener('click', () => { S.fov = Math.max(8, S.fov - 1); save('fov', S.fov); });
+$('fovUp').addEventListener('click', () => { S.fov = Math.min(60, S.fov + 1); save('fov', S.fov); });
+addEventListener('keydown', e => {
+  const f = Array.from(document.querySelectorAll('.focusable:not(.hidden)'));
+  const i = f.indexOf(document.activeElement);
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') f[(i - 1 + f.length) % f.length].focus();
+  else if (e.key === 'ArrowRight' || e.key === 'ArrowDown') f[(i + 1) % f.length].focus();
+  else if (e.key === 'Enter' && i >= 0) f[i].click();
+  else return;
+  e.preventDefault();
+});
+$('start').focus();
+
+// ---- rendering ----
+function text(s, x, y, color = '#fff', size = 20, align = 'left') {
+  ctx.fillStyle = color; ctx.font = `600 ${size}px system-ui, sans-serif`; ctx.textAlign = align; ctx.fillText(s, x, y);
+}
+function marker(p, color, label) {
+  ctx.strokeStyle = color; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(p.x, p.y, 14, 0, 2 * Math.PI); ctx.stroke();
+  if (label) text(label, p.x + 20, p.y + 7, color, 20);
+}
+function edgeArrow(dx, dy, color, label) {
+  const a = Math.atan2(dy, dx), r = 190, x = CX + Math.cos(a) * r, y = CY + Math.sin(a) * r;
+  ctx.fillStyle = color; ctx.beginPath();
+  ctx.moveTo(x + Math.cos(a) * 16, y + Math.sin(a) * 16);
+  ctx.lineTo(x + Math.cos(a + 2.5) * 14, y + Math.sin(a + 2.5) * 14);
+  ctx.lineTo(x + Math.cos(a - 2.5) * 14, y + Math.sin(a - 2.5) * 14); ctx.fill();
+  text(label, x, y + (Math.sin(a) > 0 ? -22 : 34), color, 18, 'center');
+}
+function frame() {
+  const now = performance.now();
+  if (now - S.rateT >= 1000) {
+    for (const k in S.cnt) { S.rate[k] = Math.round(S.cnt[k] * 1000 / (now - S.rateT)); S.cnt[k] = 0; }
+    S.rateT = now; S.lag = estimateLag() || S.lag; S.noise = stillNoise() ?? S.noise;
+  }
+  ctx.clearRect(0, 0, W, H);
+  if (!S.started) return requestAnimationFrame(frame);
+  if (!fresh()) {
+    text('No orientation data', CX, CY - 10, '#ffb020', 26, 'center');
+    text('permission: ' + S.perm + ' · rates ori ' + S.rate.ori + ' abs ' + S.rate.abs + ' mot ' + S.rate.mot + ' Hz', CX, CY + 24, '#9fb3c8', 18, 'center');
+    return requestAnimationFrame(frame);
+  }
+  const o = S.ori, v = view(o), hd = heading(o);
+
+  // world-locked horizon with cardinal points and 10° ticks
+  ctx.strokeStyle = '#2f8fb0'; ctx.lineWidth = 2; ctx.beginPath(); let started = false;
+  for (let d = -60; d <= 60; d += 2) {
+    const p = project(vec(v.az + d, 0), v.R, v.m);
+    if (!p) { started = false; continue; }
+    started ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y); started = true;
+  }
+  ctx.stroke();
+  for (let az = 0; az < 360; az += 10) {
+    const p = project(vec(az, 0), v.R, v.m); if (!p || p.x < 0 || p.x > W || p.y < 0 || p.y > 500) continue;
+    const card = { 0: 'N', 90: 'E', 180: 'S', 270: 'W' }[az];
+    ctx.fillStyle = card ? '#00d4ff' : '#2f8fb0'; ctx.fillRect(p.x - 1, p.y - (card ? 12 : 6), 2, card ? 24 : 12);
+    if (card) text(card, p.x, p.y - 18, '#00d4ff', 24, 'center');
+  }
+
+  // centre reticle
+  ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2; ctx.beginPath();
+  ctx.moveTo(CX - 18, CY); ctx.lineTo(CX - 6, CY); ctx.moveTo(CX + 6, CY); ctx.lineTo(CX + 18, CY);
+  ctx.moveTo(CX, CY - 18); ctx.lineTo(CX, CY - 6); ctx.moveTo(CX, CY + 6); ctx.lineTo(CX, CY + 18); ctx.stroke();
+
+  // pinned world direction
+  if (S.pin) {
+    const w = vec(S.pin.az, S.pin.el), p = project(w, v.R, v.m);
+    if (p && p.x > 10 && p.x < W - 10 && p.y > 10 && p.y < 490) marker(p, '#5dff8a', 'pin');
+    else edgeArrow(wrap(S.pin.az - v.az), -(S.pin.el - v.el), '#5dff8a', 'pin');
+  }
+
+  // sun (true-north reference)
+  let sunLine = S.geoErr ? 'location ' + S.geoErr : 'waiting for location';
+  if (S.fix) {
+    const s = sun(new Date(), S.fix.latitude, S.fix.longitude);
+    const dAz = wrap(s.az - v.az), dEl = s.el - v.el;
+    sunLine = `sun az ${s.az.toFixed(1)} el ${s.el.toFixed(1)} · view ${dAz >= 0 ? '+' : ''}${dAz.toFixed(1)} / ${dEl >= 0 ? '+' : ''}${dEl.toFixed(1)}`;
+    if (s.el > -1) {
+      const p = project(vec(s.az, s.el), v.R, v.m);
+      if (p && p.x > 10 && p.x < W - 10 && p.y > 10 && p.y < 490) marker(p, '#ffb020', 'sun');
+      else edgeArrow(dAz, -dEl, '#ffb020', 'sun');
+    }
+  }
+
+  // readouts
+  text(`HDG ${hd.toFixed(1)}°`, 16, 32, '#fff', 28);
+  text(`view az ${v.az.toFixed(1)} el ${v.el.toFixed(1)}`, 584, 32, '#fff', 20, 'right');
+  text(`α ${o.alpha.toFixed(1)}  β ${o.beta.toFixed(1)}  γ ${o.gamma.toFixed(1)}  ${o.absolute ? 'abs' : 'REL'}`, 16, 60, '#9fb3c8', 18);
+  text(`frame ${S.model || pickModel(o)}:${(MODELS[S.model || pickModel(o)]).name}${S.flip ? ' flip' : ''} · FOV ${S.fov}°`, 584, 60, '#9fb3c8', 18, 'right');
+  const lag = S.lag ? `fusion lag ~${S.lag.lag} ms (r ${S.lag.r.toFixed(2)})` : 'fusion lag: turn head briskly';
+  text(`${S.rate.abs || S.rate.ori} Hz ori · ${S.rate.mot} Hz gyro · ${lag}`, 16, 438, '#9fb3c8', 17);
+  text(`${sunLine}${S.noise != null ? ' · still ±' + S.noise.toFixed(2) + '°' : ''}`, 16, 462, '#9fb3c8', 17);
+  if (S.marks.length) {
+    const m = S.marks, parts = m.map((x, i) => x.label + ' ' + ((S.flip ? x.alpha : 360 - x.alpha) % 360).toFixed(0) + (i ? ` (Δ${wrap(x.alpha - m[i - 1].alpha).toFixed(0)})` : ''));
+    text('marks ' + parts.join('  '), 16, 486, '#5dff8a', 17);
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
